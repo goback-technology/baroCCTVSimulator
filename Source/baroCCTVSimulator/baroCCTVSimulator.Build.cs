@@ -27,5 +27,10 @@ public class baroCCTVSimulator : ModuleRules
 		{
 			"Json", "Sockets", "Networking", "ImageCore", "Projects", "RHI", "RenderCore", "ImageWrapper"
 		});
+
+		// /scene/help 가 서빙하는 계약 산문. C++ 에 박지 않고 파일로 두는 이유: 문구 수정에
+		// 리빌드·버전범프 사슬이 걸리면 문서가 낡는 쪽으로 기운다. 패키징 빌드에도 원본
+		// 텍스트 그대로 실린다(NonUFS — pak 밖 루즈 파일이라 배포 후에도 편집 가능).
+		RuntimeDependencies.Add("$(PluginDir)/docs/scene-help.md", StagedFileType.NonUFS);
 	}
 }

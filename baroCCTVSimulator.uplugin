@@ -1,7 +1,7 @@
 ﻿{
 	"FileVersion": 3,
-	"Version": 10,
-	"VersionName": "0.1.10",
+	"Version": 13,
+	"VersionName": "0.1.13",
 	"FriendlyName": "baroCCTVSimulator",
 	"Description": "CCTV PTZ 카메라 시뮬레이터 프레임워크 — Hucoms HTTP 제어 서버, 연속 MJPEG 스트리밍, PTZ 짐벌/캡처, VLA 관측 클라이언트.",
 	"Category": "Simulation",

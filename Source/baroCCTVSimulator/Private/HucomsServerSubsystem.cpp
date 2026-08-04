@@ -173,6 +173,7 @@ void UHucomsServerSubsystem::BuildChannels()
 		if (APTZCamera* Spawned = World->SpawnActor<APTZCamera>(APTZCamera::StaticClass(), Loc, Rot, Params))
 		{
 			Actors.Add(Spawned);
+			SpawnedCameras.Add(Spawned);
 			UE_LOG(LogHucomsSim, Log, TEXT("[Hucoms] 레벨에 APTZCamera 없음 -> 자동 생성 @ %s (yaw=%.1f)"), *Loc.ToString(), Yaw);
 		}
 	}
@@ -189,28 +190,9 @@ void UHucomsServerSubsystem::BuildChannels()
 		}
 
 		const bool bAutoPort = (Cam->HucomsHttpPort <= 0) || (Cam->HucomsMjpegPort <= 0);
-		TSharedPtr<FHucomsChannel> Ch = MakeShared<FHucomsChannel>();
-		Ch->Camera    = Cam;
-		Ch->HttpPort  = (Cam->HucomsHttpPort  > 0) ? Cam->HucomsHttpPort  : (BaseHttpPort  + AutoIndex);
-		Ch->MjpegPort = (Cam->HucomsMjpegPort > 0) ? Cam->HucomsMjpegPort : (BaseMjpegPort + AutoIndex);
-
-		// 홈 포즈 정렬: pan 은 설치 heading(+X)을 그대로 보게 0.
-		Ch->CurPan = Ch->TgtPan = 0;
-		// 상하 조준 이관: 이제 광학축은 액터 Pitch 를 상속하지 않으므로(롤 방지), 설치 시 액터에
-		// 넣어둔 하방 조준(Pitch)을 '틸트'로 옮겨 같은 화각을 롤 없이 재현한다.
-		//   MirrorChannel: UE pitch = TiltToPitchSign * (tilt/100)  =>  tilt = pitch / TiltToPitchSign * 100.
-		//   (TiltToPitchSign=±1 이므로 pitch*Sign*100 과 동일.)
-		const float InstallPitchDeg = Cam->GetActorRotation().Pitch;
-		Ch->CurTilt = Ch->TgtTilt = HucomsProtocol::ClampTilt(
-			FMath::RoundToInt(InstallPitchDeg * TiltToPitchSign * 100.f));
-		Ch->CurZoom = Ch->TgtZoom = 0;
-		Ch->CurFocus = Ch->TgtFocus = 0;
-
-		// 고정형: 이 채널은 PTZ 명령/모터 슬루를 무시하고 위 설치 자세(CurTilt=InstallPitch 등)로 고정.
-		Ch->bFixed = Cam->bFixedMode;
-
-		ConfigureCameraForSim(Cam);
-		Channels.Add(Ch);
+		CreateChannelForCamera(Cam,
+			(Cam->HucomsHttpPort  > 0) ? Cam->HucomsHttpPort  : (BaseHttpPort  + AutoIndex),
+			(Cam->HucomsMjpegPort > 0) ? Cam->HucomsMjpegPort : (BaseMjpegPort + AutoIndex));
 		if (bAutoPort) { ++AutoIndex; }
 	}
 }
@@ -237,6 +219,7 @@ void UHucomsServerSubsystem::SpawnConfiguredCameras(UWorld* World)
 		}
 		Cam->bServeHucoms = true;
 		Cam->bFixedMode   = Spec.bFixedMode;
+		SpawnedCameras.Add(Cam);
 		if (Spec.HttpPort  > 0) { Cam->HucomsHttpPort  = Spec.HttpPort; }
 		if (Spec.MjpegPort > 0) { Cam->HucomsMjpegPort = Spec.MjpegPort; }
 #if WITH_EDITOR
@@ -277,63 +260,7 @@ void UHucomsServerSubsystem::StartServers()
 
 	for (TSharedPtr<FHucomsChannel>& ChPtr : Channels)
 	{
-		FHucomsChannel& Ch = *ChPtr;
-
-		// bFailOnBindFailure=true: 포트를 즉시 바인드 시도, 실패(중복/점유) 시 nullptr -> 명확한 진단.
-		Ch.Router = Http.GetHttpRouter(Ch.HttpPort, /*bFailOnBindFailure=*/true);
-		if (!Ch.Router.IsValid())
-		{
-			UE_LOG(LogHucomsSim, Error, TEXT("[Hucoms] 라우터 획득/바인드 실패 (port %d). 포트 중복/점유 확인 (카메라 %s)."),
-				Ch.HttpPort, *GetNameSafe(Ch.Camera.Get()));
-			continue;
-		}
-
-		// 라우트 바인딩: 핸들러 람다가 채널(TSharedPtr)을 캡처해 그 채널의 상태에 작용.
-		auto BindGet = [this, ChPtr](const TCHAR* Path,
-			bool (UHucomsServerSubsystem::*Fn)(FHucomsChannel&, const FHttpServerRequest&, const FHttpResultCallback&))
-		{
-			FHttpRouteHandle H = ChPtr->Router->BindRoute(
-				FHttpPath(FString(Path)),
-				EHttpServerRequestVerbs::VERB_GET,
-				FHttpRequestHandler::CreateLambda(
-					[this, ChPtr, Fn](const FHttpServerRequest& Req, const FHttpResultCallback& OnComplete)
-					{
-						return (this->*Fn)(*ChPtr, Req, OnComplete);
-					}));
-			if (H.IsValid())
-			{
-				ChPtr->RouteHandles.Add(H);
-			}
-			else
-			{
-				UE_LOG(LogHucomsSim, Error, TEXT("[Hucoms] 라우트 바인딩 실패: %s (port %d)"), Path, ChPtr->HttpPort);
-			}
-		};
-
-		BindGet(TEXT("/cgi-bin/control/ptzf_status.cgi"),   &UHucomsServerSubsystem::HandlePtzfStatus);
-		BindGet(TEXT("/cgi-bin/control/ptz_centering.cgi"), &UHucomsServerSubsystem::HandlePtzCentering);
-		BindGet(TEXT("/cgi-bin/control/capabilityptz.cgi"), &UHucomsServerSubsystem::HandleCapabilityPtz);
-		BindGet(TEXT("/cgi-bin/control/pt_control.cgi"),    &UHucomsServerSubsystem::HandlePtControl);
-		BindGet(TEXT("/cgi-bin/control/zf_control.cgi"),    &UHucomsServerSubsystem::HandleZfControl);
-		BindGet(TEXT("/cgi-bin/image/jpeg.cgi"),            &UHucomsServerSubsystem::HandleJpeg);
-		BindGet(TEXT("/cgi-bin/image/mjpeg.cgi"),           &UHucomsServerSubsystem::HandleMjpeg);
-		BindGet(TEXT("/api/tuning"),                        &UHucomsServerSubsystem::HandleTuning);
-
-		// 연속 MJPEG 스트림 서버(채널별 포트).
-		if (bEnableMjpegStream)
-		{
-			Ch.Stream = new FMjpegStreamServer();
-			if (!Ch.Stream->StartServer(Ch.MjpegPort, StreamFps))
-			{
-				delete Ch.Stream;
-				Ch.Stream = nullptr;
-				UE_LOG(LogHucomsSim, Error, TEXT("[Hucoms] MJPEG 스트림 서버 시작 실패 (port %d)"), Ch.MjpegPort);
-			}
-		}
-
-		++StartedCount;
-		UE_LOG(LogHucomsSim, Log, TEXT("[Hucoms] 채널 기동: 카메라 '%s'  HTTP :%d  MJPEG :%d"),
-			*GetNameSafe(Ch.Camera.Get()), Ch.HttpPort, (Ch.Stream ? Ch.MjpegPort : -1));
+		if (StartChannelServers(ChPtr)) { ++StartedCount; }
 	}
 
 	Http.StartAllListeners();
@@ -367,27 +294,7 @@ void UHucomsServerSubsystem::StopServers()
 
 	for (TSharedPtr<FHucomsChannel>& ChPtr : Channels)
 	{
-		FHucomsChannel& Ch = *ChPtr;
-
-		if (Ch.Router.IsValid())
-		{
-			for (const FHttpRouteHandle& H : Ch.RouteHandles)
-			{
-				if (H.IsValid())
-				{
-					Ch.Router->UnbindRoute(H);
-				}
-			}
-		}
-		Ch.RouteHandles.Reset();
-		Ch.Router.Reset();
-
-		if (Ch.Stream)
-		{
-			Ch.Stream->StopServer();
-			delete Ch.Stream;
-			Ch.Stream = nullptr;
-		}
+		StopChannel(*ChPtr);
 	}
 	Channels.Reset();
 
@@ -397,6 +304,288 @@ void UHucomsServerSubsystem::StopServers()
 		FHttpServerModule::Get().StopAllListeners();
 		bServersStarted = false;
 		UE_LOG(LogHucomsSim, Log, TEXT("[Hucoms] 시뮬레이터 서버 정지(모든 채널)."));
+	}
+}
+
+TSharedPtr<FHucomsChannel> UHucomsServerSubsystem::CreateChannelForCamera(APTZCamera* Cam, int32 InHttpPort, int32 InMjpegPort)
+{
+	TSharedPtr<FHucomsChannel> Ch = MakeShared<FHucomsChannel>();
+	Ch->Camera    = Cam;
+	Ch->HttpPort  = InHttpPort;
+	Ch->MjpegPort = InMjpegPort;
+
+	// 홈 포즈 정렬: pan 은 설치 heading(+X)을 그대로 보게 0.
+	Ch->CurPan = Ch->TgtPan = 0;
+	// 상하 조준 이관: 광학축은 액터 Pitch 를 상속하지 않으므로(롤 방지), 설치 시 액터에
+	// 넣어둔 하방 조준(Pitch)을 '틸트'로 옮겨 같은 화각을 롤 없이 재현한다.
+	//   MirrorChannel: UE pitch = TiltToPitchSign * (tilt/100)  =>  tilt = pitch / TiltToPitchSign * 100.
+	//   (TiltToPitchSign=±1 이므로 pitch*Sign*100 과 동일.)
+	const float InstallPitchDeg = Cam->GetActorRotation().Pitch;
+	Ch->CurTilt = Ch->TgtTilt = HucomsProtocol::ClampTilt(
+		FMath::RoundToInt(InstallPitchDeg * TiltToPitchSign * 100.f));
+	Ch->CurZoom = Ch->TgtZoom = 0;
+	Ch->CurFocus = Ch->TgtFocus = 0;
+
+	// 고정형: 이 채널은 PTZ 명령/모터 슬루를 무시하고 설치 자세(CurTilt=InstallPitch 등)로 고정.
+	Ch->bFixed = Cam->bFixedMode;
+
+	ConfigureCameraForSim(Cam);
+	Channels.Add(Ch);
+	return Ch;
+}
+
+bool UHucomsServerSubsystem::StartChannelServers(TSharedPtr<FHucomsChannel> ChPtr)
+{
+	FHucomsChannel& Ch = *ChPtr;
+	FHttpServerModule& Http = FHttpServerModule::Get();
+
+	// bFailOnBindFailure=true: 포트를 즉시 바인드 시도, 실패(중복/점유) 시 nullptr -> 명확한 진단.
+	Ch.Router = Http.GetHttpRouter(Ch.HttpPort, /*bFailOnBindFailure=*/true);
+	if (!Ch.Router.IsValid())
+	{
+		UE_LOG(LogHucomsSim, Error, TEXT("[Hucoms] 라우터 획득/바인드 실패 (port %d). 포트 중복/점유 확인 (카메라 %s)."),
+			Ch.HttpPort, *GetNameSafe(Ch.Camera.Get()));
+		return false;
+	}
+
+	// 라우트 바인딩: 핸들러 람다가 채널(TSharedPtr)을 캡처해 그 채널의 상태에 작용.
+	auto BindGet = [this, ChPtr](const TCHAR* Path,
+		bool (UHucomsServerSubsystem::*Fn)(FHucomsChannel&, const FHttpServerRequest&, const FHttpResultCallback&))
+	{
+		FHttpRouteHandle H = ChPtr->Router->BindRoute(
+			FHttpPath(FString(Path)),
+			EHttpServerRequestVerbs::VERB_GET,
+			FHttpRequestHandler::CreateLambda(
+				[this, ChPtr, Fn](const FHttpServerRequest& Req, const FHttpResultCallback& OnComplete)
+				{
+					return (this->*Fn)(*ChPtr, Req, OnComplete);
+				}));
+		if (H.IsValid())
+		{
+			ChPtr->RouteHandles.Add(H);
+		}
+		else
+		{
+			UE_LOG(LogHucomsSim, Error, TEXT("[Hucoms] 라우트 바인딩 실패: %s (port %d)"), Path, ChPtr->HttpPort);
+		}
+	};
+
+	BindGet(TEXT("/cgi-bin/control/ptzf_status.cgi"),   &UHucomsServerSubsystem::HandlePtzfStatus);
+	BindGet(TEXT("/cgi-bin/control/ptz_centering.cgi"), &UHucomsServerSubsystem::HandlePtzCentering);
+	BindGet(TEXT("/cgi-bin/control/capabilityptz.cgi"), &UHucomsServerSubsystem::HandleCapabilityPtz);
+	BindGet(TEXT("/cgi-bin/control/pt_control.cgi"),    &UHucomsServerSubsystem::HandlePtControl);
+	BindGet(TEXT("/cgi-bin/control/zf_control.cgi"),    &UHucomsServerSubsystem::HandleZfControl);
+	BindGet(TEXT("/cgi-bin/image/jpeg.cgi"),            &UHucomsServerSubsystem::HandleJpeg);
+	BindGet(TEXT("/cgi-bin/image/mjpeg.cgi"),           &UHucomsServerSubsystem::HandleMjpeg);
+	BindGet(TEXT("/api/tuning"),                        &UHucomsServerSubsystem::HandleTuning);
+
+	// 연속 MJPEG 스트림 서버(채널별 포트).
+	if (bEnableMjpegStream)
+	{
+		Ch.Stream = new FMjpegStreamServer();
+		if (!Ch.Stream->StartServer(Ch.MjpegPort, StreamFps))
+		{
+			delete Ch.Stream;
+			Ch.Stream = nullptr;
+			UE_LOG(LogHucomsSim, Error, TEXT("[Hucoms] MJPEG 스트림 서버 시작 실패 (port %d)"), Ch.MjpegPort);
+		}
+	}
+
+	UE_LOG(LogHucomsSim, Log, TEXT("[Hucoms] 채널 기동: 카메라 '%s'  HTTP :%d  MJPEG :%d"),
+		*GetNameSafe(Ch.Camera.Get()), Ch.HttpPort, (Ch.Stream ? Ch.MjpegPort : -1));
+	return true;
+}
+
+void UHucomsServerSubsystem::StopChannel(FHucomsChannel& Ch)
+{
+	if (Ch.Router.IsValid())
+	{
+		for (const FHttpRouteHandle& H : Ch.RouteHandles)
+		{
+			if (H.IsValid())
+			{
+				Ch.Router->UnbindRoute(H);
+			}
+		}
+	}
+	Ch.RouteHandles.Reset();
+	Ch.Router.Reset();
+
+	if (Ch.Stream)
+	{
+		Ch.Stream->StopServer();
+		delete Ch.Stream;
+		Ch.Stream = nullptr;
+	}
+}
+
+TSharedPtr<FHucomsChannel> UHucomsServerSubsystem::FindChannelFor(const APTZCamera* Cam) const
+{
+	for (const TSharedPtr<FHucomsChannel>& ChPtr : Channels)
+	{
+		if (ChPtr.IsValid() && ChPtr->Camera.Get() == Cam)
+		{
+			return ChPtr;
+		}
+	}
+	return nullptr;
+}
+
+bool UHucomsServerSubsystem::IsSpawnedCamera(const APTZCamera* Cam) const
+{
+	return Cam && SpawnedCameras.Contains(Cam);
+}
+
+APTZCamera* UHucomsServerSubsystem::SpawnCameraRuntime(const FPTZCameraSpawnSpec& Spec, FString& OutError)
+{
+	UWorld* World = GetWorld();
+	if (!World) { OutError = TEXT("월드 없음"); return nullptr; }
+	if (Spec.HttpPort <= 0 || Spec.MjpegPort <= 0)
+	{
+		OutError = TEXT("httpPort/mjpegPort 명시 필수 (자동 부여는 액터 열거순이라 비결정적 — 허용하지 않음)");
+		return nullptr;
+	}
+	if (Spec.HttpPort == Spec.MjpegPort)
+	{
+		OutError = TEXT("httpPort 와 mjpegPort 가 같음");
+		return nullptr;
+	}
+	// 기존 채널과의 포트 충돌은 bind 실패보다 앞서 명확히 거른다(어느 카메라와 겹치는지 말해 준다).
+	for (const TSharedPtr<FHucomsChannel>& ChPtr : Channels)
+	{
+		if (!ChPtr.IsValid()) { continue; }
+		const int32 Ports[2] = { Spec.HttpPort, Spec.MjpegPort };
+		for (int32 P : Ports)
+		{
+			if (ChPtr->HttpPort == P || ChPtr->MjpegPort == P)
+			{
+				OutError = FString::Printf(TEXT("포트 %d 는 카메라 '%s' 가 사용 중"), P, *GetNameSafe(ChPtr->Camera.Get()));
+				return nullptr;
+			}
+		}
+	}
+
+	FActorSpawnParameters Params;
+	Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	const FRotator Rot(Spec.PitchDeg, Spec.YawDeg, 0.f); // Pitch 는 CreateChannelForCamera 가 tilt 로 이관
+	APTZCamera* Cam = World->SpawnActor<APTZCamera>(APTZCamera::StaticClass(), Spec.Location, Rot, Params);
+	if (!Cam) { OutError = TEXT("카메라 액터 스폰 실패"); return nullptr; }
+
+	Cam->bServeHucoms   = true;
+	Cam->bFixedMode     = Spec.bFixedMode;
+	Cam->HucomsHttpPort  = Spec.HttpPort;
+	Cam->HucomsMjpegPort = Spec.MjpegPort;
+	SpawnedCameras.Add(Cam);
+#if WITH_EDITOR
+	if (!Spec.Note.IsEmpty()) { Cam->SetActorLabel(FString::Printf(TEXT("PTZ_Api_%s"), *Spec.Note)); }
+#endif
+
+	// 부팅 시 카메라 0대여서 서버 미기동이었던 경우의 지연 초기화(비동기 인코딩 전제 조건 포함).
+	if (bAsyncStreamCapture && !CompletedFrames)
+	{
+		FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
+		CompletedFrames = MakeShared<TQueue<FCompletedStreamFrame, EQueueMode::Mpsc>, ESPMode::ThreadSafe>();
+	}
+
+	TSharedPtr<FHucomsChannel> Ch = CreateChannelForCamera(Cam, Spec.HttpPort, Spec.MjpegPort);
+	if (!StartChannelServers(Ch))
+	{
+		Channels.Remove(Ch);
+		SpawnedCameras.Remove(Cam);
+		Cam->Destroy();
+		OutError = FString::Printf(TEXT("포트 바인드 실패 (http=%d — OS 레벨 점유/중복 확인)"), Spec.HttpPort);
+		return nullptr;
+	}
+	FHttpServerModule::Get().StartAllListeners();   // 이미 시작된 리스너는 no-op, 새 포트만 개시
+	bServersStarted = true;
+
+	UE_LOG(LogHucomsSim, Log, TEXT("[Hucoms] 런타임 카메라 스폰(API): '%s' @ %s yaw=%.1f pitch=%.1f http=%d mjpeg=%d"),
+		*Cam->GetName(), *Spec.Location.ToString(), Spec.YawDeg, Spec.PitchDeg, Spec.HttpPort, Spec.MjpegPort);
+	return Cam;
+}
+
+bool UHucomsServerSubsystem::UpdateCameraPose(APTZCamera* Cam, const FVector* Location, const float* YawDeg, const float* PitchDeg, FString& OutError)
+{
+	if (!IsSpawnedCamera(Cam))
+	{
+		OutError = TEXT("레벨 저작 카메라는 API 로 이동할 수 없음 (스폰 카메라만 — 레벨 저작은 에디터에서)");
+		return false;
+	}
+	TSharedPtr<FHucomsChannel> Ch = FindChannelFor(Cam);
+
+	if (Location) { Cam->SetActorLocation(*Location); }
+	if (YawDeg)
+	{
+		FRotator R = Cam->GetActorRotation();
+		R.Yaw = *YawDeg;
+		R.Roll = 0.f;
+		Cam->SetActorRotation(R);
+	}
+	if (PitchDeg)
+	{
+		// 설치 피치는 채널 tilt 로 산다(BuildChannels 이관 규약). 액터 회전에도 기록해
+		// GetSpawnedCameraSpecs(스냅샷)가 액터만 봐도 왕복이 성립하게 한다.
+		FRotator R = Cam->GetActorRotation();
+		R.Pitch = *PitchDeg;
+		Cam->SetActorRotation(R);
+		if (Ch.IsValid())
+		{
+			Ch->CurTilt = Ch->TgtTilt = HucomsProtocol::ClampTilt(
+				FMath::RoundToInt(*PitchDeg * TiltToPitchSign * 100.f));
+		}
+	}
+	if (Ch.IsValid()) { MirrorChannel(*Ch); }   // 다음 캡처가 즉시 새 자세로 렌더되게
+	return true;
+}
+
+bool UHucomsServerSubsystem::RemoveCameraRuntime(APTZCamera* Cam, FString& OutError)
+{
+	if (!IsSpawnedCamera(Cam))
+	{
+		OutError = TEXT("레벨 저작 카메라는 API 로 삭제할 수 없음 (스폰 카메라만)");
+		return false;
+	}
+
+	TSharedPtr<FHucomsChannel> Ch = FindChannelFor(Cam);
+	if (Ch.IsValid())
+	{
+		// 비동기 리드백 종료 규율(StopServers 와 동일): in-flight 렌더커맨드가 채널 소유
+		// readback 을 물고 있으면 flush 후에만 파괴가 안전하다.
+		if (bAsyncStreamCapture && Ch->StreamCapState != EStreamCapState::Idle)
+		{
+			FlushRenderingCommands();
+		}
+		ReleaseChannelCapture(*Ch, TEXT("카메라 삭제(API)"));
+		StopChannel(*Ch);
+		Channels.Remove(Ch);
+	}
+	SpawnedCameras.Remove(Cam);
+	const FString Name = Cam->GetName();
+	Cam->Destroy();
+	UE_LOG(LogHucomsSim, Log, TEXT("[Hucoms] 런타임 카메라 삭제(API): '%s'"), *Name);
+	return true;
+}
+
+void UHucomsServerSubsystem::GetSpawnedCameraSpecs(TArray<FPTZCameraSpawnSpec>& OutSpecs, TArray<APTZCamera*>* OutCams) const
+{
+	OutSpecs.Reset();
+	if (OutCams) { OutCams->Reset(); }
+	for (const TSharedPtr<FHucomsChannel>& ChPtr : Channels)
+	{
+		if (!ChPtr.IsValid()) { continue; }
+		APTZCamera* Cam = ChPtr->Camera.Get();
+		if (!Cam || !SpawnedCameras.Contains(Cam)) { continue; }
+
+		FPTZCameraSpawnSpec Spec;
+		Spec.Location  = Cam->GetActorLocation();
+		Spec.YawDeg    = Cam->GetActorRotation().Yaw;
+		// 설치 피치는 채널 tilt 가 진실(이관 규약의 역변환, Sign=±1 이라 tilt*Sign/100).
+		Spec.PitchDeg  = ChPtr->CurTilt * TiltToPitchSign / 100.f;
+		Spec.HttpPort  = ChPtr->HttpPort;
+		Spec.MjpegPort = ChPtr->MjpegPort;
+		Spec.bFixedMode = ChPtr->bFixed;
+		OutSpecs.Add(Spec);
+		if (OutCams) { OutCams->Add(Cam); }
 	}
 }
 

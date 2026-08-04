@@ -6,6 +6,74 @@
 
 ## Entries
 
+- 2026-08-03: **v0.1.13 — 카메라 런타임 생명주기 + 씬 스냅샷. BEV 데이터셋 루프의 두 병목 제거.**
+  - 동기(이교수님): BEV(BEVHeight류) 자율 파인튜닝 — 학습 성능은 카메라 기하 다양성에서 나온다
+    (`paper_works/object3d_model_review` 실측: 학습에 없던 5.75m 높이에서 공개 체크포인트 0%).
+    기존 config 스포너는 포즈 변경마다 ini 수정 + 재시작이라 에이전트 루프가 못 돈다.
+  - **카메라 API**: `POST /scene/cameras`(런타임 스폰 — 포트 명시 필수, 채널·리스너 런타임 증설),
+    `PATCH /scene/cameras/:id`(location/yawDeg/pitchDeg — pitch 는 tilt 이관 규약 그대로),
+    `DELETE`(in-flight flush→라우트 unbind→MJPEG 정지→캡처 반납→파괴). 목록에 `spawned` 필드.
+    **레벨 저작 카메라는 403** — 스폰 출자(`SpawnedCameras` set: 자동/config/API)만 이동·삭제 가능.
+  - 구조: BuildChannels/StartServers/StopServers 의 채널 단위 로직을 `CreateChannelForCamera`/
+    `StartChannelServers`/`StopChannel` 로 추출해 부팅 경로와 런타임 경로가 같은 코드를 쓴다.
+  - **스냅샷 API**: `GET /scene/snapshot`(차량 전수 + 스폰 카메라 스펙 — 파일 저장 없음, 호출자 보관),
+    `POST`(차량 전량 리셋 후 재배치, 카메라는 httpPort 키 reconcile: 이동/스폰/제거).
+    자유 배치 차량은 `baseTransform` 을 따로 싣는다 — 합성된 transform 을 기준으로 재사용하면
+    offset 이 이중 적용되기 때문. 레벨 불일치 409(force 강행), 부분 실패는 failures[] 로 보고.
+  - 검증(standalone -game, `tools/scene-test/camera-snapshot-contract.mjs` **33개 전수 통과**):
+    스폰 즉시 CGI 응답(pitch -30 → tiltpos 3000)·실렌더 JPEG, 이동 반영(tilt 4500), 저작 카메라
+    403, 삭제 후 포트 닫힘, 스냅샷 왕복에서 차량 배치(슬롯·transform·차종·색·번호판) 완전 일치 +
+    카메라 reconcile(이동 1·제거 1) 정확. offset-contract 회귀 통과.
+  - 함정 하나 정정: scene-help.md 의 Hucoms 경로가 `/cgi-bin/ptz/getptzfpos` 로 잘못 적혀 있었다
+    (실제는 `/cgi-bin/control/ptzf_status.cgi?action=getptzfpos`, 응답은 `panpos = N` 줄 형식) —
+    계약 테스트가 잡아냈다. 자기서술이 틀리면 소스 없는 소비자에겐 그대로 사고다.
+- 2026-08-03: **v0.1.12 — 자기서술 `GET /scene`·`/scene/help`. 소스 없이 포트 하나로 계약 발견.**
+  - 이교수님 제기: 다른 세션이 소스·참고자료·저장소 없이 sim 을 쓰려면 help API 가 있어야 한다
+    (baro_calory `GET /api/help` 와 같은 원칙 — 라우트 사용 규약이 저장소 문서 안에만 있으면
+    외부 에이전트가 볼 수 없다. 패키징된 sim 은 docs/ 조차 없으니 더 심하다).
+  - **산문은 C++ 가 아니라 `docs/scene-help.md` 텍스트 파일이다(이교수님 지적으로 방향 수정 —
+    처음엔 C++ 에 JSON 으로 박았었다).** 문구 수정 = 파일 저장이 전부: 리빌드·버전범프 사슬 없음,
+    요청마다 다시 읽어 재시작도 불필요(마커 추가→즉시 서빙→제거→즉시 사라짐 실검증).
+    C++(`HandleHelp`)는 로드 + `{{LEVEL}}` 등 라이브 토큰 6종 치환 + text/markdown 서빙만.
+  - 패키징: `Build.cs` `RuntimeDependencies`(`$(PluginDir)/docs/scene-help.md`, NonUFS)로 원본
+    텍스트가 pak 밖 루즈 파일로 실린다 — 배포 후에도 편집 가능. 파일이 없으면 404 대신 내장
+    최소 도움말로 응답(발견 가능성 유지, 경고 로그).
+  - 문서 내용: 라이브 상태·공통 규약(전송/좌표/에러/번호판/값범위)·배치 모델(offset)·엔드포인트
+    전수(요청/응답 shape)·Hucoms CGI 조인(포트·단위·tiltpos 부호)·curl 빠른 시작. 유지 규칙:
+    **API 표면 변경 시 scene-help.md 와 호스트 docs/scene-control-api.md 를 같이 고친다**.
+  - 검증(standalone -game): `/scene`·`/scene/help` 동일 서빙, 토큰 실치환(레벨·v0.1.12·24면·6대),
+    무빌드 수정 실증, offset-contract 전 항목 재통과. charset 중복(Create 가 자동 부가) 수정.
+- 2026-08-03: **v0.1.11 — 차량 배치 변형(`offset`). 주차면에 붙인 채로 비껴·틀어·반대로 세운다.**
+  - 이교수님 요구: "차량 배치할 때 조금씩 위치를 변형 — 좌우로 비껴, 10도쯤 틀어, 180도 반대로도."
+    기존 RPC 로도 `transform` 자유 좌표로 같은 렌더는 만들 수 있었지만 그 경로는 **주차면 소속을
+    버린다**(slotId=null, 점유 미등록, 409 방어·carId 조인 소멸). 그래서 자유 좌표가 아니라
+    "기준 + 변형" 으로 쪼갠다.
+  - 계약: `POST/PATCH /scene/cars` 에 `offset {location, rotation}` 추가, 응답에도 에코.
+    최종 배치 = `Offset * Base`(UE FTransform 곱) — **변형의 축은 월드축이 아니라 기준의 로컬축**이다.
+    sim_01 주차면 yaw 가 -87.51 이라 곱 순서를 뒤집으면 그대로 오배치다. `SceneControlPlacementTest`
+    가 그 순서를 잠근다.
+  - 상태 분리: `FSimCarState` 가 `BaseTransform`(주차면 or 자유좌표) / `OffsetLocation`+`OffsetRotation`
+    / `Transform`(합성 결과) 셋을 따로 든다. 덕분에 ① offset 은 누적 델타가 아니라 **값**(같은 값을
+    다시 PATCH 해도 제자리) ② 주차면을 옮기면 변형이 따라간다.
+  - **offset 을 FTransform 으로 안 들고 있는 이유**: FTransform 에 넣으면 사분원수로 접혔다 펴지면서
+    yaw 10 이 9.999999999999998 로 에코된다. 배치엔 무해하지만 "보낸 값이 그대로 돌아온다"가 깨지고
+    JS Fake 와도 어긋난다. 그래서 받은 FVector/FRotator 를 그대로 보관하고 합성 때만 조립한다.
+  - 함께 정리한 두 가지(둘 다 조용한 무시를 없애는 쪽):
+    `slotId`+`transform` 동시 지정은 이제 **400**(예전엔 transform 을 말없이 버렸다. 게다가 JS Fake 는
+    반대로 transform 을 살려서 실 sim 과 계약이 갈려 있었다). PATCH 의 `transform` 도 무시하지 않고
+    **자유 좌표 기준 교체**로 동작한다(붙어 있던 주차면은 점유 해제).
+  - 검증: UE 자동화 5/5 Success(신규 배치 테스트 포함). standalone `-game` 실기동에서 JS
+    `composePlacement` 와 10개 자세 대조 — **위치 오차 0cm, 회전 최대 5.6e-12°**. 다축(pitch/roll/yaw
+    동시)과 짐벌 임계 밴드 안팎(89.5 / 89.9 / 89.99 / ±90)까지 포함. 렌더 A/B(같은 차·같은 자리,
+    offset 만 차이)로 실제로 비뚤게 서는 것까지 눈으로 확인.
+  - **UE 짐벌 락 규약(JS 포팅에서 알아낸 것)**: 피치 ±90 에서는 일반식의 `YawY`·`YawX` 가 둘 다 0 이라
+    `atan2` 가 잡음이다. UE 는 그 구간에서 roll 을 yaw 로 접고(`roll=0`) `yaw = ±2*atan2(X, W)` 를 쓴다.
+    임계는 `SingularityTest > 0.4999995`(피치 약 89.94° 부터). 흔한 공개 구현들과 다르므로 UE 출력과
+    맞춰야 하는 코드는 이 규칙을 따라야 한다.
+  - 검증 하네스(같은 날): 소비 저장소(baro_calory)를 같이 고치지 않는다(이교수님 확정 — 처음에
+    고쳤다가 전량 복원). 대신 호스트 저장소 `tools/scene-test/offset-contract.mjs` 가 UE 회전 규약의
+    JS 참조 구현을 들고 실행 중 sim 에 수치·동작 계약을 전수 대조한다(의존성 0). 소비자 연동
+    (라우터 필드 통과 등)은 별도 결정 사항으로 남아 있다.
 - 2026-07-24: **v0.1.10 — 연속 스트림 캡처를 비동기 GPU 리드백으로(품질 무손실). 6대 카메라당 +73%.**
   - 발단: 6대 동시 MJPEG 카메라당 3.3fps·게임 틱 2.5fps. 이교수님 "품질 양보 불가, 구조적으로 개선".
   - 4각도 적대적 검증(wf_4a5a001e)으로 오칭 정정: 병목은 `FImageUtils::GetRenderTargetImage`→

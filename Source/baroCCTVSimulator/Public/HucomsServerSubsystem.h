@@ -363,6 +363,32 @@ public:
 	 */
 	bool GetCameraPorts(const APTZCamera* Cam, int32& OutHttpPort, int32& OutMjpegPort) const;
 
+	//==================================================================================
+	// 런타임 카메라 생명주기 (씬 제어 API /scene/cameras 가 호출) — v0.1.13
+	//
+	// BEV 파인튜닝의 병목이 "카메라 포즈를 바꾸려면 ini 수정 + 재시작"이었다. 스폰/이동/삭제를
+	// 실행 중에 열되, 레벨 저작 카메라(폴 위 PTZCamera_N)는 보호한다 — 저작은 이교수님 소관.
+	//==================================================================================
+
+	/** 이 카메라가 스폰 경로(자동/config/API)로 만들어졌는가 — 이동/삭제 허용 판정. */
+	bool IsSpawnedCamera(const APTZCamera* Cam) const;
+
+	/** 스펙대로 카메라를 지금 스폰하고 채널(HTTP CGI + MJPEG)까지 기동한다. 실패 시 nullptr + OutError. */
+	APTZCamera* SpawnCameraRuntime(const FPTZCameraSpawnSpec& Spec, FString& OutError);
+
+	/**
+	 * 스폰 카메라의 설치 자세 갱신. 널이 아닌 인자만 반영한다.
+	 * PitchDeg 는 액터 회전이 아니라 채널 tilt 로 산다(BuildChannels 의 이관 규약과 동일) —
+	 * 액터에도 기록해 스냅샷 왕복이 성립한다. 레벨 저작 카메라면 false + OutError.
+	 */
+	bool UpdateCameraPose(APTZCamera* Cam, const FVector* Location, const float* YawDeg, const float* PitchDeg, FString& OutError);
+
+	/** 스폰 카메라를 채널 정리(in-flight flush·라우트 unbind·MJPEG 정지·캡처 반납) 후 파괴. 레벨 저작이면 false. */
+	bool RemoveCameraRuntime(APTZCamera* Cam, FString& OutError);
+
+	/** 현재 스폰 카메라들을 재스폰 가능한 스펙으로 직렬화(/scene/snapshot 용). OutCams 는 같은 순서. */
+	void GetSpawnedCameraSpecs(TArray<FPTZCameraSpawnSpec>& OutSpecs, TArray<APTZCamera*>* OutCams = nullptr) const;
+
 private:
 	bool bServersStarted = false;
 	bool bAutoSpawnAttempted = false;
@@ -371,8 +397,23 @@ private:
 	// 카메라별 채널 (TSharedPtr 로 안정된 포인터 → 라우트 핸들러 람다가 캡처).
 	TArray<TSharedPtr<FHucomsChannel>> Channels;
 
+	/** 스폰 경로(자동/config/API)로 만들어진 카메라 — 레벨 저작과 구분(이동/삭제 게이트). */
+	TSet<TWeakObjectPtr<const APTZCamera>> SpawnedCameras;
+
 	void StartServers();
 	void StopServers();
+
+	/** 카메라 1대의 채널 상태를 만들어 Channels 에 추가(포트·tilt 이관·bFixed·sim 설정). */
+	TSharedPtr<FHucomsChannel> CreateChannelForCamera(APTZCamera* Cam, int32 InHttpPort, int32 InMjpegPort);
+
+	/** 채널 1개의 라우터 획득·라우트 바인딩·MJPEG 기동(StartServers 의 채널부와 동일 경로). 실패 시 false. */
+	bool StartChannelServers(TSharedPtr<FHucomsChannel> ChPtr);
+
+	/** 채널 1개 정지 — 라우트 unbind·라우터 해제·MJPEG 정지(캡처 반납은 호출자 책임). */
+	void StopChannel(FHucomsChannel& Ch);
+
+	/** 이 카메라의 채널을 찾는다. 없으면 nullptr. */
+	TSharedPtr<FHucomsChannel> FindChannelFor(const APTZCamera* Cam) const;
 
 	/** 레벨의 APTZCamera(bServeHucoms) 들을 열거해 채널을 만든다(포트 부여 + 카메라 sim 설정). */
 	void BuildChannels();

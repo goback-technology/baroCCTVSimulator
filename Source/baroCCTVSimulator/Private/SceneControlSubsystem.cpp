@@ -16,6 +16,7 @@
 #include "Components/MeshComponent.h"         // UMeshComponent (차량 렌더 메시 aggregate bounds)
 #include "UObject/UnrealType.h"              // FIntProperty, FArrayProperty, FindFProperty, FScriptArrayHelper
 #include "UObject/SoftObjectPath.h"          // FSoftObjectPath::GetAssetName (Mesh_List 가 soft 참조일 때)
+#include "Misc/FileHelper.h"                 // scene-help.md 로드 (/scene/help — 산문은 파일, 코드는 서빙만)
 
 #include "PTZCamera.h"                        // APTZCamera (오버레이 투영 대상 카메라)
 #include "HucomsProtocol.h"                   // zoompos->HFOV 공용 실측표
@@ -104,10 +105,8 @@ namespace
 		return Root;
 	}
 
-	TSharedRef<FJsonObject> TransformToJson(const FTransform& X)
+	TSharedRef<FJsonObject> PlacementToJson(const FVector& Loc, const FRotator& Rot)
 	{
-		const FVector Loc = X.GetLocation();
-		const FRotator Rot = X.Rotator();
 		TSharedRef<FJsonObject> L = MakeShared<FJsonObject>();
 		L->SetNumberField(TEXT("x"), Loc.X); L->SetNumberField(TEXT("y"), Loc.Y); L->SetNumberField(TEXT("z"), Loc.Z);
 		TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
@@ -118,24 +117,36 @@ namespace
 		return O;
 	}
 
-	FTransform ParseTransform(const TSharedPtr<FJsonObject>& O)
+	TSharedRef<FJsonObject> TransformToJson(const FTransform& X)
 	{
-		FVector Loc = FVector::ZeroVector;
-		FRotator Rot = FRotator::ZeroRotator;
+		return PlacementToJson(X.GetLocation(), X.Rotator());
+	}
+
+	// 빠진 성분은 0 — 항등이 곧 "변형 없음"이다.
+	void ParsePlacement(const TSharedPtr<FJsonObject>& O, FVector& OutLoc, FRotator& OutRot)
+	{
+		OutLoc = FVector::ZeroVector;
+		OutRot = FRotator::ZeroRotator;
 		const TSharedPtr<FJsonObject>* L;
 		if (O->TryGetObjectField(TEXT("location"), L))
 		{
 			double x = 0, y = 0, z = 0;
 			(*L)->TryGetNumberField(TEXT("x"), x); (*L)->TryGetNumberField(TEXT("y"), y); (*L)->TryGetNumberField(TEXT("z"), z);
-			Loc = FVector(x, y, z);
+			OutLoc = FVector(x, y, z);
 		}
 		const TSharedPtr<FJsonObject>* R;
 		if (O->TryGetObjectField(TEXT("rotation"), R))
 		{
 			double p = 0, yw = 0, rl = 0;
 			(*R)->TryGetNumberField(TEXT("pitch"), p); (*R)->TryGetNumberField(TEXT("yaw"), yw); (*R)->TryGetNumberField(TEXT("roll"), rl);
-			Rot = FRotator(p, yw, rl);
+			OutRot = FRotator(p, yw, rl);
 		}
+	}
+
+	FTransform ParseTransform(const TSharedPtr<FJsonObject>& O)
+	{
+		FVector Loc; FRotator Rot;
+		ParsePlacement(O, Loc, Rot);
 		return FTransform(Rot, Loc);
 	}
 
@@ -146,6 +157,7 @@ namespace
 		if (S.SlotId.IsEmpty()) { O->SetField(TEXT("slotId"), MakeShared<FJsonValueNull>()); }
 		else { O->SetStringField(TEXT("slotId"), S.SlotId); }
 		O->SetObjectField(TEXT("transform"), TransformToJson(S.Transform));
+		O->SetObjectField(TEXT("offset"), PlacementToJson(S.OffsetLocation, S.OffsetRotation));
 		O->SetNumberField(TEXT("carType"), S.CarType);
 		O->SetNumberField(TEXT("color"), S.Color);
 		TSharedRef<FJsonObject> P = MakeShared<FJsonObject>();
@@ -604,11 +616,16 @@ void USceneControlSubsystem::StartServer()
 	using EV = EHttpServerRequestVerbs;
 	Bind(TEXT("/scene/catalog"),   EV::VERB_GET, &USceneControlSubsystem::HandleCatalog);
 	Bind(TEXT("/scene/slots"),     EV::VERB_GET, &USceneControlSubsystem::HandleSlots);
-	Bind(TEXT("/scene/cameras"),   EV::VERB_GET, &USceneControlSubsystem::HandleCameras);
+	Bind(TEXT("/scene/cameras"),   EV::VERB_GET | EV::VERB_POST, &USceneControlSubsystem::HandleCameras);
+	Bind(TEXT("/scene/cameras/:id"), EV::VERB_PATCH | EV::VERB_DELETE, &USceneControlSubsystem::HandleCameraById);
+	Bind(TEXT("/scene/snapshot"),  EV::VERB_GET | EV::VERB_POST, &USceneControlSubsystem::HandleSnapshot);
 	Bind(TEXT("/scene/project"),   EV::VERB_POST, &USceneControlSubsystem::HandleProject);
 	Bind(TEXT("/scene/cars"),      EV::VERB_GET | EV::VERB_POST, &USceneControlSubsystem::HandleCars);
 	Bind(TEXT("/scene/cars/:id"),  EV::VERB_GET | EV::VERB_PATCH | EV::VERB_DELETE, &USceneControlSubsystem::HandleCarById);
 	Bind(TEXT("/scene/reset"),     EV::VERB_POST, &USceneControlSubsystem::HandleReset);
+	// 자기서술 — 소스·문서 없이 접속한 에이전트가 포트 하나로 전체 계약을 발견한다.
+	Bind(TEXT("/scene/help"),      EV::VERB_GET, &USceneControlSubsystem::HandleHelp);
+	Bind(TEXT("/scene"),           EV::VERB_GET, &USceneControlSubsystem::HandleHelp);
 
 	Http.StartAllListeners();
 	bStarted = true;
@@ -880,19 +897,149 @@ bool USceneControlSubsystem::HandleSlots(const FHttpServerRequest& /*Req*/, cons
 	return true;
 }
 
-bool USceneControlSubsystem::HandleCameras(const FHttpServerRequest& /*Req*/, const FHttpResultCallback& OnComplete)
+bool USceneControlSubsystem::HandleCameras(const FHttpServerRequest& Req, const FHttpResultCallback& OnComplete)
 {
+	// POST = 런타임 스폰(v0.1.13) — BEV 데이터셋용 카메라 포즈 다양화가 목적. 레벨 무수정.
+	if (Req.Verb == EHttpServerRequestVerbs::VERB_POST)
+	{
+		TSharedPtr<FJsonObject> Body = ParseBody(Req);
+		if (!Body.IsValid()) { OnComplete(JsonError(EHttpServerResponseCodes::BadRequest, TEXT("JSON 파싱 실패"))); return true; }
+
+		const TSharedPtr<FJsonObject>* LocObj;
+		if (!Body->TryGetObjectField(TEXT("location"), LocObj))
+		{
+			OnComplete(JsonError(EHttpServerResponseCodes::BadRequest, TEXT("location {x,y,z} 필요 (광학중심 월드 cm)")));
+			return true;
+		}
+		FPTZCameraSpawnSpec Spec;
+		{
+			double x = 0, y = 0, z = 0;
+			(*LocObj)->TryGetNumberField(TEXT("x"), x); (*LocObj)->TryGetNumberField(TEXT("y"), y); (*LocObj)->TryGetNumberField(TEXT("z"), z);
+			Spec.Location = FVector(x, y, z);
+		}
+		double Yaw = 0.0, Pitch = -20.0;   // pitch 기본 -20 = 하향 20도(config 스포너와 동일 기본)
+		Body->TryGetNumberField(TEXT("yawDeg"), Yaw);
+		Body->TryGetNumberField(TEXT("pitchDeg"), Pitch);
+		Spec.YawDeg = static_cast<float>(Yaw);
+		Spec.PitchDeg = static_cast<float>(Pitch);
+		int32 HttpPort = 0, MjpegPort = 0;
+		Body->TryGetNumberField(TEXT("httpPort"), HttpPort);
+		Body->TryGetNumberField(TEXT("mjpegPort"), MjpegPort);
+		Spec.HttpPort = HttpPort;
+		Spec.MjpegPort = MjpegPort;
+		if (HttpPort == ScenePort || MjpegPort == ScenePort)
+		{
+			OnComplete(JsonError(EHttpServerResponseCodes::BadRequest, FString::Printf(TEXT("씬 제어 포트(%d)와 충돌"), ScenePort)));
+			return true;
+		}
+		bool bFixed = false; Body->TryGetBoolField(TEXT("fixed"), bFixed);
+		Spec.bFixedMode = bFixed;
+		Body->TryGetStringField(TEXT("note"), Spec.Note);
+
+		UHucomsServerSubsystem* Hu = GetWorld() ? GetWorld()->GetSubsystem<UHucomsServerSubsystem>() : nullptr;
+		if (!Hu) { OnComplete(JsonError(EHttpServerResponseCodes::ServerError, TEXT("Hucoms 서브시스템 없음"))); return true; }
+		FString Err;
+		APTZCamera* Cam = Hu->SpawnCameraRuntime(Spec, Err);
+		if (!Cam) { OnComplete(JsonError(EHttpServerResponseCodes::BadRequest, Err)); return true; }
+
+		TArray<FSlotInfo> Slots;
+		CollectSlots(GetWorld(), ParkingSlotClassPrefix, Slots);
+		FCamEntry E; E.Cam = Cam; E.Http = Spec.HttpPort; E.Mjpeg = Spec.MjpegPort;
+		TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+		Root->SetObjectField(TEXT("camera"), CameraToJson(E, CalculateGroundReference(Slots)));
+		OnComplete(JsonResp(Root));
+		return true;
+	}
+
 	TArray<FCamEntry> Cams;
 	CollectCameras(GetWorld(), Cams);
 	TArray<FSlotInfo> Slots;
 	CollectSlots(GetWorld(), ParkingSlotClassPrefix, Slots);
 	const FGroundReference Ground = CalculateGroundReference(Slots);
+	UHucomsServerSubsystem* Hu = GetWorld() ? GetWorld()->GetSubsystem<UHucomsServerSubsystem>() : nullptr;
 
 	TArray<TSharedPtr<FJsonValue>> Arr;
-	for (const FCamEntry& E : Cams) { Arr.Add(MakeShared<FJsonValueObject>(CameraToJson(E, Ground))); }
+	for (const FCamEntry& E : Cams)
+	{
+		TSharedRef<FJsonObject> O = CameraToJson(E, Ground);
+		// 이동/삭제 가능 여부(스폰 카메라 vs 레벨 저작)를 목록에서 바로 알게 한다.
+		O->SetBoolField(TEXT("spawned"), Hu && Hu->IsSpawnedCamera(E.Cam));
+		Arr.Add(MakeShared<FJsonValueObject>(O));
+	}
 
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetArrayField(TEXT("cameras"), Arr);
+	OnComplete(JsonResp(Root));
+	return true;
+}
+
+bool USceneControlSubsystem::HandleCameraById(const FHttpServerRequest& Req, const FHttpResultCallback& OnComplete)
+{
+	const FString Id = Req.PathParams.FindRef(TEXT("id"));
+	TArray<FCamEntry> Cams;
+	CollectCameras(GetWorld(), Cams);
+	const int32 IdAsPort = FCString::Atoi(*Id);   // 숫자면 hucomsPort 로도 매칭(devices 조인 키와 동일)
+	const FCamEntry* Found = Cams.FindByPredicate([&](const FCamEntry& E)
+	{
+		return E.Cam->GetName() == Id || (IdAsPort > 0 && E.Http == IdAsPort);
+	});
+	if (!Found)
+	{
+		OnComplete(JsonError(EHttpServerResponseCodes::NotFound, FString::Printf(TEXT("카메라 없음: %s"), *Id)));
+		return true;
+	}
+	UHucomsServerSubsystem* Hu = GetWorld() ? GetWorld()->GetSubsystem<UHucomsServerSubsystem>() : nullptr;
+	if (!Hu) { OnComplete(JsonError(EHttpServerResponseCodes::ServerError, TEXT("Hucoms 서브시스템 없음"))); return true; }
+
+	if (Req.Verb == EHttpServerRequestVerbs::VERB_DELETE)
+	{
+		const FString Name = Found->Cam->GetName();
+		FString Err;
+		if (!Hu->RemoveCameraRuntime(Found->Cam, Err))
+		{
+			OnComplete(JsonError(EHttpServerResponseCodes::Forbidden, Err));
+			return true;
+		}
+		TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+		Root->SetStringField(TEXT("removed"), Name);
+		OnComplete(JsonResp(Root));
+		return true;
+	}
+
+	// PATCH = 설치 자세 갱신(넘긴 필드만): location(cm) / yawDeg(설치 방위) / pitchDeg(설치 하향각→tilt).
+	TSharedPtr<FJsonObject> Body = ParseBody(Req);
+	if (!Body.IsValid()) { OnComplete(JsonError(EHttpServerResponseCodes::BadRequest, TEXT("JSON 파싱 실패"))); return true; }
+
+	FVector Loc; bool bHasLoc = false;
+	const TSharedPtr<FJsonObject>* LocObj;
+	if (Body->TryGetObjectField(TEXT("location"), LocObj))
+	{
+		double x = 0, y = 0, z = 0;
+		(*LocObj)->TryGetNumberField(TEXT("x"), x); (*LocObj)->TryGetNumberField(TEXT("y"), y); (*LocObj)->TryGetNumberField(TEXT("z"), z);
+		Loc = FVector(x, y, z); bHasLoc = true;
+	}
+	double YawD = 0.0, PitchD = 0.0;
+	const bool bHasYaw = Body->TryGetNumberField(TEXT("yawDeg"), YawD);
+	const bool bHasPitch = Body->TryGetNumberField(TEXT("pitchDeg"), PitchD);
+	if (!bHasLoc && !bHasYaw && !bHasPitch)
+	{
+		OnComplete(JsonError(EHttpServerResponseCodes::BadRequest, TEXT("갱신할 필드 없음 (location/yawDeg/pitchDeg)")));
+		return true;
+	}
+	const float Yaw = static_cast<float>(YawD), Pitch = static_cast<float>(PitchD);
+	FString Err;
+	if (!Hu->UpdateCameraPose(Found->Cam, bHasLoc ? &Loc : nullptr, bHasYaw ? &Yaw : nullptr, bHasPitch ? &Pitch : nullptr, Err))
+	{
+		OnComplete(JsonError(EHttpServerResponseCodes::Forbidden, Err));
+		return true;
+	}
+
+	TArray<FSlotInfo> Slots;
+	CollectSlots(GetWorld(), ParkingSlotClassPrefix, Slots);
+	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> CamJson = CameraToJson(*Found, CalculateGroundReference(Slots));
+	CamJson->SetBoolField(TEXT("spawned"), true);
+	Root->SetObjectField(TEXT("camera"), CamJson);
 	OnComplete(JsonResp(Root));
 	return true;
 }
@@ -1043,10 +1190,19 @@ bool USceneControlSubsystem::HandleCars(const FHttpServerRequest& Req, const FHt
 
 	bool bForce = false; Body->TryGetBoolField(TEXT("force"), bForce);
 
-	// 배치: slotId(슬롯) 우선, 없으면 transform(자유 좌표).
+	// 배치 기준: slotId(주차면 트랜스폼) 또는 transform(자유 좌표) 중 하나.
+	// 둘 다 오면 어느 쪽을 버릴지 서버가 정할 근거가 없으므로 거절한다 — 주차면 기준 변형은 offset 이다.
 	FString SlotId;
 	Body->TryGetStringField(TEXT("slotId"), SlotId);
-	FTransform Xform = FTransform::Identity;
+	const TSharedPtr<FJsonObject>* TObj = nullptr;
+	const bool bHasTransform = Body->TryGetObjectField(TEXT("transform"), TObj);
+	if (!SlotId.IsEmpty() && bHasTransform)
+	{
+		OnComplete(JsonError(EHttpServerResponseCodes::BadRequest,
+			TEXT("slotId 와 transform 은 동시에 지정할 수 없음 (주차면 기준 변형은 offset)")));
+		return true;
+	}
+
 	if (!SlotId.IsEmpty())
 	{
 		TArray<FSlotInfo> Slots; CollectSlots(GetWorld(), ParkingSlotClassPrefix, Slots);
@@ -1057,21 +1213,28 @@ bool USceneControlSubsystem::HandleCars(const FHttpServerRequest& Req, const FHt
 			if (!bForce) { OnComplete(JsonError(EHttpServerResponseCodes::Conflict, FString::Printf(TEXT("주차면 점유됨: %s"), *SlotId))); return true; }
 			EvictSlotOccupant(SlotId);   // force = 기존 점유 차량 파괴 후 덮어쓰기(겹쳐 스폰 방지).
 		}
-		Xform = Found->Xform;
+		S.BaseTransform = Found->Xform;
 		S.SlotId = SlotId;
+	}
+	else if (bHasTransform)
+	{
+		S.BaseTransform = ParseTransform(*TObj);
 	}
 	else
 	{
-		const TSharedPtr<FJsonObject>* TObj;
-		if (Body->TryGetObjectField(TEXT("transform"), TObj)) { Xform = ParseTransform(*TObj); }
-		else { OnComplete(JsonError(EHttpServerResponseCodes::BadRequest, TEXT("slotId 또는 transform 필요"))); return true; }
+		OnComplete(JsonError(EHttpServerResponseCodes::BadRequest, TEXT("slotId 또는 transform 필요"))); return true;
 	}
 
-	AActor* Car = SpawnCarActor(Xform);
+	// 기준 로컬 변형(선택). 없으면 항등 = 예전과 동일한 배치.
+	const TSharedPtr<FJsonObject>* OffObj;
+	if (Body->TryGetObjectField(TEXT("offset"), OffObj)) { ParsePlacement(*OffObj, S.OffsetLocation, S.OffsetRotation); }
+	RecomposePlacement(S);
+
+	// 스폰은 AlwaysSpawn 이라 변형으로 옆 차와 겹쳐도 밀려나지 않는다 — 준 좌표에 그대로 선다.
+	AActor* Car = SpawnCarActor(S.Transform);
 	if (!Car) { OnComplete(JsonError(EHttpServerResponseCodes::ServerError, TEXT("차량 스폰 실패 (BP 로드 확인)"))); return true; }
 
 	S.Id = FString::Printf(TEXT("car-%02d"), ++CarSeq);
-	S.Transform = Xform;
 	S.Actor = Car;
 	NormalizeKoreanPlate(S);
 	ApplyToActor(Car, S);
@@ -1128,9 +1291,23 @@ bool USceneControlSubsystem::HandleCarById(const FHttpServerRequest& Req, const 
 		if ((*PlateObj)->TryGetStringField(TEXT("number"), Str)) { S->Number = Str; }
 	}
 
-	// 슬롯 이동
+	// 배치 갱신 — 셋 다 "값"이지 누적 델타가 아니다(같은 offset 을 두 번 보내도 결과가 같다).
+	//   slotId    : 주차면 이동(기준 교체, offset 은 따라간다) / "" = 주차면에서 분리(현 위치 유지)
+	//   transform : 자유 좌표로 기준 교체(붙어 있던 주차면은 점유 해제)
+	//   offset    : 기준 로컬 변형 교체
 	FString NewSlot;
-	if (Body->TryGetStringField(TEXT("slotId"), NewSlot) && NewSlot != S->SlotId)
+	const bool bHasSlot = Body->TryGetStringField(TEXT("slotId"), NewSlot);
+	const TSharedPtr<FJsonObject>* TObj = nullptr;
+	const bool bHasTransform = Body->TryGetObjectField(TEXT("transform"), TObj);
+	if (bHasSlot && !NewSlot.IsEmpty() && bHasTransform)
+	{
+		OnComplete(JsonError(EHttpServerResponseCodes::BadRequest,
+			TEXT("slotId 와 transform 은 동시에 지정할 수 없음 (주차면 기준 변형은 offset)")));
+		return true;
+	}
+
+	bool bPlacementDirty = false;
+	if (bHasSlot && NewSlot != S->SlotId)
 	{
 		bool bForce = false; Body->TryGetBoolField(TEXT("force"), bForce);
 		if (!NewSlot.IsEmpty())
@@ -1145,15 +1322,36 @@ bool USceneControlSubsystem::HandleCarById(const FHttpServerRequest& Req, const 
 			}
 			if (!S->SlotId.IsEmpty()) { SlotOccupancy.Remove(S->SlotId); }
 			S->SlotId = NewSlot;
-			S->Transform = Found->Xform;
+			S->BaseTransform = Found->Xform;
 			SlotOccupancy.Add(NewSlot, Id);
-			if (AActor* A = S->Actor.Get()) { A->SetActorTransform(Found->Xform); }
+			bPlacementDirty = true;
 		}
 		else
 		{
+			// 분리는 점유만 푼다 — 기준도 배치도 그대로라 차는 있던 자리에 서 있는다.
 			if (!S->SlotId.IsEmpty()) { SlotOccupancy.Remove(S->SlotId); }
 			S->SlotId = TEXT("");
 		}
+	}
+
+	if (bHasTransform)
+	{
+		if (!S->SlotId.IsEmpty()) { SlotOccupancy.Remove(S->SlotId); S->SlotId = TEXT(""); }
+		S->BaseTransform = ParseTransform(*TObj);
+		bPlacementDirty = true;
+	}
+
+	const TSharedPtr<FJsonObject>* OffObj;
+	if (Body->TryGetObjectField(TEXT("offset"), OffObj))
+	{
+		ParsePlacement(*OffObj, S->OffsetLocation, S->OffsetRotation);
+		bPlacementDirty = true;
+	}
+
+	if (bPlacementDirty)
+	{
+		RecomposePlacement(*S);
+		if (AActor* A = S->Actor.Get()) { A->SetActorTransform(S->Transform); }
 	}
 
 	NormalizeKoreanPlate(*S);
@@ -1178,5 +1376,284 @@ bool USceneControlSubsystem::HandleReset(const FHttpServerRequest& /*Req*/, cons
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetNumberField(TEXT("cleared"), N);
 	OnComplete(JsonResp(Root));
+	return true;
+}
+
+bool USceneControlSubsystem::RestoreCarFromJson(const TSharedPtr<FJsonObject>& CarObj, FString& OutError)
+{
+	FSimCarState S;
+	int32 CarType = 0, Color = 0;
+	CarObj->TryGetNumberField(TEXT("carType"), CarType);
+	CarObj->TryGetNumberField(TEXT("color"), Color);
+	S.CarType = ClampCarType(CarType);
+	S.Color = FMath::Clamp(Color, 0, 7);
+
+	const TSharedPtr<FJsonObject>* PlateObj;
+	if (CarObj->TryGetObjectField(TEXT("plate"), PlateObj))
+	{
+		int32 PT = 0; (*PlateObj)->TryGetNumberField(TEXT("type"), PT); S.PlateType = FMath::Clamp(PT, 0, 2);
+		(*PlateObj)->TryGetStringField(TEXT("city"), S.City);
+		(*PlateObj)->TryGetStringField(TEXT("prefix"), S.Prefix);
+		(*PlateObj)->TryGetStringField(TEXT("kor"), S.Kor);
+		(*PlateObj)->TryGetStringField(TEXT("number"), S.Number);
+	}
+
+	const TSharedPtr<FJsonObject>* OffObj;
+	if (CarObj->TryGetObjectField(TEXT("offset"), OffObj)) { ParsePlacement(*OffObj, S.OffsetLocation, S.OffsetRotation); }
+
+	// 기준: slotId(주차면) 우선, 자유 배치는 baseTransform(스냅샷 GET 이 슬롯 미배치 차량에만 실어 준다).
+	// 응답의 transform(합성 결과)을 기준으로 쓰면 offset 이 두 번 적용되므로 읽지 않는다.
+	FString SlotId;
+	CarObj->TryGetStringField(TEXT("slotId"), SlotId);   // JSON null 이면 실패 → 빈 문자열 유지
+	if (!SlotId.IsEmpty())
+	{
+		TArray<FSlotInfo> Slots; CollectSlots(GetWorld(), ParkingSlotClassPrefix, Slots);
+		const FSlotInfo* FoundSlot = Slots.FindByPredicate([&](const FSlotInfo& X) { return X.Id == SlotId; });
+		if (!FoundSlot) { OutError = FString::Printf(TEXT("주차면 없음: %s"), *SlotId); return false; }
+		if (SlotOccupancy.Contains(SlotId)) { OutError = FString::Printf(TEXT("주차면 중복(스냅샷 안에 두 번): %s"), *SlotId); return false; }
+		S.BaseTransform = FoundSlot->Xform;
+		S.SlotId = SlotId;
+	}
+	else
+	{
+		const TSharedPtr<FJsonObject>* BaseObj;
+		if (CarObj->TryGetObjectField(TEXT("baseTransform"), BaseObj)) { S.BaseTransform = ParseTransform(*BaseObj); }
+		else { OutError = TEXT("slotId 도 baseTransform 도 없음"); return false; }
+	}
+	RecomposePlacement(S);
+
+	AActor* Car = SpawnCarActor(S.Transform);
+	if (!Car) { OutError = TEXT("차량 스폰 실패 (BP 로드 확인)"); return false; }
+	S.Id = FString::Printf(TEXT("car-%02d"), ++CarSeq);
+	S.Actor = Car;
+	NormalizeKoreanPlate(S);
+	ApplyToActor(Car, S);
+	Cars.Add(S.Id, S);
+	if (!S.SlotId.IsEmpty()) { SlotOccupancy.Add(S.SlotId, S.Id); }
+	return true;
+}
+
+bool USceneControlSubsystem::HandleSnapshot(const FHttpServerRequest& Req, const FHttpResultCallback& OnComplete)
+{
+	// 씬 스냅샷(v0.1.13) — "살아있는 월드가 진실, 저장은 호출자" 철학은 유지한다: 서버는 파일을
+	// 남기지 않고, GET 이 복원 가능한 JSON 을 주고 POST 가 그 JSON 을 그대로 받는다.
+	// 범위: API 스폰 차량 전수 + 스폰 카메라(자동/config/API)의 설치 스펙. 레벨 저작 액터와
+	// 현재 PTZ 상태(Hucoms 축)는 범위 밖이다. 차량 id 는 보존되지 않는다(순번 재부여).
+	UHucomsServerSubsystem* Hu = GetWorld() ? GetWorld()->GetSubsystem<UHucomsServerSubsystem>() : nullptr;
+	FString Level;
+	if (UWorld* W = GetWorld()) { Level = W->GetMapName(); Level.RemoveFromStart(W->StreamingLevelsPrefix); }
+
+	if (Req.Verb == EHttpServerRequestVerbs::VERB_GET)
+	{
+		TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+		Root->SetStringField(TEXT("level"), Level);
+		FString PluginVer = TEXT("?");
+		if (TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("baroCCTVSimulator"))) { PluginVer = Plugin->GetDescriptor().VersionName; }
+		Root->SetStringField(TEXT("pluginVersion"), PluginVer);
+		Root->SetStringField(TEXT("savedAtUtc"), FDateTime::UtcNow().ToIso8601());
+
+		TArray<TSharedPtr<FJsonValue>> CarArr;
+		for (TPair<FString, FSimCarState>& Pair : Cars)
+		{
+			TSharedRef<FJsonObject> O = CarToJson(Pair.Value);
+			// 자유 배치 차량은 기준을 따로 실어야 복원이 정확하다(transform 은 offset 이 이미 합성된 값).
+			if (Pair.Value.SlotId.IsEmpty()) { O->SetObjectField(TEXT("baseTransform"), TransformToJson(Pair.Value.BaseTransform)); }
+			CarArr.Add(MakeShared<FJsonValueObject>(O));
+		}
+		Root->SetArrayField(TEXT("cars"), CarArr);
+
+		TArray<TSharedPtr<FJsonValue>> CamArr;
+		if (Hu)
+		{
+			TArray<FPTZCameraSpawnSpec> Specs; TArray<APTZCamera*> SpecCams;
+			Hu->GetSpawnedCameraSpecs(Specs, &SpecCams);
+			for (int32 i = 0; i < Specs.Num(); ++i)
+			{
+				TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+				O->SetStringField(TEXT("id"), SpecCams.IsValidIndex(i) ? SpecCams[i]->GetName() : TEXT(""));
+				TSharedRef<FJsonObject> L = MakeShared<FJsonObject>();
+				L->SetNumberField(TEXT("x"), Specs[i].Location.X);
+				L->SetNumberField(TEXT("y"), Specs[i].Location.Y);
+				L->SetNumberField(TEXT("z"), Specs[i].Location.Z);
+				O->SetObjectField(TEXT("location"), L);
+				O->SetNumberField(TEXT("yawDeg"), Specs[i].YawDeg);
+				O->SetNumberField(TEXT("pitchDeg"), Specs[i].PitchDeg);
+				O->SetNumberField(TEXT("httpPort"), Specs[i].HttpPort);
+				O->SetNumberField(TEXT("mjpegPort"), Specs[i].MjpegPort);
+				O->SetBoolField(TEXT("fixed"), Specs[i].bFixedMode);
+				CamArr.Add(MakeShared<FJsonValueObject>(O));
+			}
+		}
+		Root->SetArrayField(TEXT("cameras"), CamArr);
+		OnComplete(JsonResp(Root));
+		return true;
+	}
+
+	// POST = 복원. cars 는 전량 리셋 후 재배치, cameras 는 httpPort 를 키로 reconcile
+	// (같은 포트 = 이동, 없는 포트 = 스폰, 스냅샷에 없는 스폰 카메라 = 제거 — 포트 재바인드 최소화).
+	TSharedPtr<FJsonObject> Body = ParseBody(Req);
+	if (!Body.IsValid()) { OnComplete(JsonError(EHttpServerResponseCodes::BadRequest, TEXT("JSON 파싱 실패"))); return true; }
+	bool bForce = false; Body->TryGetBoolField(TEXT("force"), bForce);
+	FString SnapLevel;
+	if (Body->TryGetStringField(TEXT("level"), SnapLevel) && !SnapLevel.IsEmpty() && SnapLevel != Level && !bForce)
+	{
+		OnComplete(JsonError(EHttpServerResponseCodes::Conflict,
+			FString::Printf(TEXT("스냅샷 레벨 불일치(%s ≠ %s) — 다른 월드의 좌표. 강행은 force:true"), *SnapLevel, *Level)));
+		return true;
+	}
+
+	int32 CamSpawnedN = 0, CamMovedN = 0, CamRemovedN = 0;
+	TArray<FString> Failures;
+	if (Hu)
+	{
+		// 원하는 카메라 목록 파싱
+		TArray<FPTZCameraSpawnSpec> Desired;
+		const TArray<TSharedPtr<FJsonValue>>* CamArr;
+		if (Body->TryGetArrayField(TEXT("cameras"), CamArr))
+		{
+			for (const TSharedPtr<FJsonValue>& V : *CamArr)
+			{
+				const TSharedPtr<FJsonObject> O = V->AsObject();
+				if (!O.IsValid()) { continue; }
+				FPTZCameraSpawnSpec D;
+				const TSharedPtr<FJsonObject>* LocObj;
+				if (O->TryGetObjectField(TEXT("location"), LocObj))
+				{
+					double x = 0, y = 0, z = 0;
+					(*LocObj)->TryGetNumberField(TEXT("x"), x); (*LocObj)->TryGetNumberField(TEXT("y"), y); (*LocObj)->TryGetNumberField(TEXT("z"), z);
+					D.Location = FVector(x, y, z);
+				}
+				double Yaw = 0.0, Pitch = -20.0;
+				O->TryGetNumberField(TEXT("yawDeg"), Yaw); O->TryGetNumberField(TEXT("pitchDeg"), Pitch);
+				D.YawDeg = static_cast<float>(Yaw); D.PitchDeg = static_cast<float>(Pitch);
+				O->TryGetNumberField(TEXT("httpPort"), D.HttpPort);
+				O->TryGetNumberField(TEXT("mjpegPort"), D.MjpegPort);
+				bool bFx = false; O->TryGetBoolField(TEXT("fixed"), bFx); D.bFixedMode = bFx;
+				Desired.Add(D);
+			}
+		}
+
+		// 1) 스냅샷에 없는(또는 mjpeg/fixed 가 달라진) 현재 스폰 카메라 제거
+		{
+			TArray<FPTZCameraSpawnSpec> CurSpecs; TArray<APTZCamera*> CurCams;
+			Hu->GetSpawnedCameraSpecs(CurSpecs, &CurCams);
+			for (int32 i = 0; i < CurSpecs.Num(); ++i)
+			{
+				const FPTZCameraSpawnSpec* D = Desired.FindByPredicate(
+					[&](const FPTZCameraSpawnSpec& X) { return X.HttpPort == CurSpecs[i].HttpPort; });
+				const bool bKeep = D && D->MjpegPort == CurSpecs[i].MjpegPort && D->bFixedMode == CurSpecs[i].bFixedMode;
+				if (!bKeep && CurCams.IsValidIndex(i))
+				{
+					FString Err;
+					if (Hu->RemoveCameraRuntime(CurCams[i], Err)) { ++CamRemovedN; }
+					else { Failures.Add(FString::Printf(TEXT("카메라 제거 실패: %s"), *Err)); }
+				}
+			}
+		}
+		// 2) 원하는 목록을 이동(기존 포트) 또는 스폰(새 포트)
+		for (const FPTZCameraSpawnSpec& D : Desired)
+		{
+			TArray<FPTZCameraSpawnSpec> NowSpecs; TArray<APTZCamera*> NowCams;
+			Hu->GetSpawnedCameraSpecs(NowSpecs, &NowCams);
+			const int32 Idx = NowSpecs.IndexOfByPredicate(
+				[&](const FPTZCameraSpawnSpec& X) { return X.HttpPort == D.HttpPort; });
+			FString Err;
+			if (Idx != INDEX_NONE && NowCams.IsValidIndex(Idx))
+			{
+				const float Yaw = D.YawDeg, Pitch = D.PitchDeg;
+				if (Hu->UpdateCameraPose(NowCams[Idx], &D.Location, &Yaw, &Pitch, Err)) { ++CamMovedN; }
+				else { Failures.Add(FString::Printf(TEXT("카메라 이동 실패(:%d): %s"), D.HttpPort, *Err)); }
+			}
+			else
+			{
+				if (Hu->SpawnCameraRuntime(D, Err)) { ++CamSpawnedN; }
+				else { Failures.Add(FString::Printf(TEXT("카메라 스폰 실패(:%d): %s"), D.HttpPort, *Err)); }
+			}
+		}
+	}
+
+	// 3) 차량: 전량 리셋 후 스냅샷 순서대로 재배치
+	for (TPair<FString, FSimCarState>& Pair : Cars)
+	{
+		if (AActor* A = Pair.Value.Actor.Get()) { A->Destroy(); }
+	}
+	Cars.Reset();
+	SlotOccupancy.Reset();
+	int32 CarsRestoredN = 0;
+	const TArray<TSharedPtr<FJsonValue>>* CarArr;
+	if (Body->TryGetArrayField(TEXT("cars"), CarArr))
+	{
+		for (const TSharedPtr<FJsonValue>& V : *CarArr)
+		{
+			const TSharedPtr<FJsonObject> O = V->AsObject();
+			if (!O.IsValid()) { continue; }
+			FString Err;
+			if (RestoreCarFromJson(O, Err)) { ++CarsRestoredN; }
+			else { Failures.Add(FString::Printf(TEXT("차량 복원 실패: %s"), *Err)); }
+		}
+	}
+
+	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("level"), Level);
+	TSharedRef<FJsonObject> CarsR = MakeShared<FJsonObject>();
+	CarsR->SetNumberField(TEXT("restored"), CarsRestoredN);
+	Root->SetObjectField(TEXT("cars"), CarsR);
+	TSharedRef<FJsonObject> CamsR = MakeShared<FJsonObject>();
+	CamsR->SetNumberField(TEXT("spawned"), CamSpawnedN);
+	CamsR->SetNumberField(TEXT("moved"), CamMovedN);
+	CamsR->SetNumberField(TEXT("removed"), CamRemovedN);
+	Root->SetObjectField(TEXT("cameras"), CamsR);
+	TArray<TSharedPtr<FJsonValue>> FailArr;
+	for (const FString& F : Failures) { FailArr.Add(MakeShared<FJsonValueString>(F)); }
+	Root->SetArrayField(TEXT("failures"), FailArr);
+	OnComplete(JsonResp(Root));
+	return true;
+}
+
+bool USceneControlSubsystem::HandleHelp(const FHttpServerRequest& /*Req*/, const FHttpResultCallback& OnComplete)
+{
+	// 자기서술 — 소스·저장소·문서 없이 씬 포트 하나로 접속한 에이전트가 전체 계약을 발견하게 한다.
+	// 산문은 C++ 가 아니라 플러그인 docs/scene-help.md 에 있다: 문구 수정 = 파일 저장이 전부다
+	// (리빌드 불필요, 요청마다 다시 읽으므로 재시작도 불필요). C++ 는 로드 + 라이브 토큰 치환 +
+	// 서빙만 한다. 패키징 빌드에 파일을 싣는 것은 Build.cs 의 RuntimeDependencies 가 담당한다.
+	FString Doc;
+	FString DocPath;
+	if (TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("baroCCTVSimulator")))
+	{
+		DocPath = Plugin->GetBaseDir() / TEXT("docs/scene-help.md");
+		FFileHelper::LoadFileToString(Doc, *DocPath);
+	}
+	if (Doc.IsEmpty())
+	{
+		// 파일이 없어도(스테이징 누락 등) 발견 가능성은 유지한다 — 최소 도움말로 응답.
+		UE_LOG(LogSceneCtrl, Warning, TEXT("[Scene] scene-help.md 없음(%s) — 내장 최소 도움말로 응답."), *DocPath);
+		Doc = TEXT("# /scene/* 씬 제어 REST\n\n"
+			"상세 문서 파일(플러그인 docs/scene-help.md)이 이 배포에 없습니다.\n\n"
+			"엔드포인트: GET /scene/catalog · GET /scene/slots · GET /scene/cameras · POST /scene/project ·\n"
+			"GET|POST /scene/cars (POST: {slotId|transform, offset?, carType, color, plate?, force?}) ·\n"
+			"GET|PATCH|DELETE /scene/cars/:id · POST /scene/reset · GET /scene/help\n\n"
+			"라이브: 레벨 {{LEVEL}} · 플러그인 v{{PLUGIN_VERSION}} · 씬 포트 {{SCENE_PORT}} · "
+			"주차면 {{SLOT_COUNT}} · 카메라 {{CAMERA_COUNT}} · 스폰 차량 {{SPAWNED_CAR_COUNT}}\n");
+	}
+
+	// 라이브 토큰 — 낡을 수 있는 수치는 문서에 박지 않고 서빙 시각에 치환한다.
+	FString Level;
+	if (UWorld* W = GetWorld()) { Level = W->GetMapName(); Level.RemoveFromStart(W->StreamingLevelsPrefix); }
+	FString PluginVer = TEXT("?");
+	if (TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("baroCCTVSimulator"))) { PluginVer = Plugin->GetDescriptor().VersionName; }
+	TArray<FSlotInfo> Slots; CollectSlots(GetWorld(), ParkingSlotClassPrefix, Slots);
+	int32 CameraCount = 0;
+	if (UWorld* W = GetWorld()) { for (TActorIterator<APTZCamera> It(W); It; ++It) { ++CameraCount; } }
+	Doc.ReplaceInline(TEXT("{{LEVEL}}"), *Level, ESearchCase::CaseSensitive);
+	Doc.ReplaceInline(TEXT("{{PLUGIN_VERSION}}"), *PluginVer, ESearchCase::CaseSensitive);
+	Doc.ReplaceInline(TEXT("{{SCENE_PORT}}"), *FString::FromInt(ScenePort), ESearchCase::CaseSensitive);
+	Doc.ReplaceInline(TEXT("{{SLOT_COUNT}}"), *FString::FromInt(Slots.Num()), ESearchCase::CaseSensitive);
+	Doc.ReplaceInline(TEXT("{{CAMERA_COUNT}}"), *FString::FromInt(CameraCount), ESearchCase::CaseSensitive);
+	Doc.ReplaceInline(TEXT("{{SPAWNED_CAR_COUNT}}"), *FString::FromInt(Cars.Num()), ESearchCase::CaseSensitive);
+
+	// charset 은 FHttpServerResponse::Create 가 자동으로 붙인다(;charset=utf-8) — 여기 넣으면 중복된다.
+	TUniquePtr<FHttpServerResponse> R = FHttpServerResponse::Create(Doc, TEXT("text/markdown"));
+	R->Code = EHttpServerResponseCodes::Ok;
+	OnComplete(MoveTemp(R));
 	return true;
 }
